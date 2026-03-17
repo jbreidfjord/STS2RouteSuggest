@@ -15,6 +15,56 @@ using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 namespace RouteSuggest;
 
 /// <summary>
+/// Defines how a room type's weight scales with a projected resource.
+/// </summary>
+public class ScalingRule
+{
+    /// <summary>
+    /// Which resource this scales with: "Gold", "Health", or "InverseHealth".
+    /// Gold: modifier increases with more gold. Health: modifier increases with higher HP%.
+    /// InverseHealth: modifier increases with lower HP% (e.g., rest sites are more valuable when hurt).
+    /// </summary>
+    public string Resource { get; set; }
+
+    /// <summary>
+    /// The resource value at which the modifier equals 1.0 (no change from base weight).
+    /// For Gold: an absolute gold amount (e.g., 100). For Health/InverseHealth: a health fraction 0.0-1.0.
+    /// </summary>
+    public double Baseline { get; set; }
+}
+
+/// <summary>
+/// Configuration for dynamic scoring: resource projections and scaling rules.
+/// </summary>
+public class DynamicScoringConfig
+{
+    /// <summary>
+    /// Estimated gold change per room type (e.g., Monster: +25, Shop: -80).
+    /// </summary>
+    public Dictionary<MapPointType, int> GoldDeltas { get; set; } = new Dictionary<MapPointType, int>();
+
+    /// <summary>
+    /// Estimated health change per room type (e.g., Monster: -15, RestSite: +30).
+    /// </summary>
+    public Dictionary<MapPointType, int> HealthDeltas { get; set; } = new Dictionary<MapPointType, int>();
+
+    /// <summary>
+    /// Per-room-type scaling rules. Absent entries use no scaling (modifier = 1.0).
+    /// </summary>
+    public Dictionary<MapPointType, ScalingRule> ScalingRules { get; set; } = new Dictionary<MapPointType, ScalingRule>();
+
+    /// <summary>
+    /// Minimum modifier clamp (default 0.0). Prevents weights from going too negative via scaling.
+    /// </summary>
+    public double MinModifier { get; set; } = 0.0;
+
+    /// <summary>
+    /// Maximum modifier clamp (default 2.0). Prevents weights from scaling too high.
+    /// </summary>
+    public double MaxModifier { get; set; } = 2.0;
+}
+
+/// <summary>
 /// Configuration for a path type including scoring weights, color, and priority.
 /// </summary>
 public class PathConfig
@@ -41,22 +91,93 @@ public class PathConfig
     public Dictionary<MapPointType, int> ScoringWeights { get; set; } = new Dictionary<MapPointType, int>();
 
     /// <summary>
+    /// Whether dynamic scoring is enabled for this path config.
+    /// When enabled, room weights are scaled based on projected gold and health.
+    /// </summary>
+    public bool DynamicScoringEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Dynamic scoring configuration with resource projections and scaling rules.
+    /// </summary>
+    public DynamicScoringConfig DynamicScoring { get; set; } = new DynamicScoringConfig();
+
+    /// <summary>
     /// Calculates the total score for a given path using this configuration's scoring weights.
+    /// When dynamic scoring is enabled and game state is available, weights are scaled
+    /// based on projected gold and health at each node.
     /// </summary>
     /// <param name="path">List of map points representing the path to score.</param>
+    /// <param name="currentGold">Current gold amount, or -1 if unavailable.</param>
+    /// <param name="currentHp">Current health, or -1 if unavailable.</param>
+    /// <param name="maxHp">Maximum health, or -1 if unavailable.</param>
     /// <returns>The total score, or 0 if path is null or empty.</returns>
-    public int CalculateScore(List<MapPoint> path)
+    public double CalculateScore(List<MapPoint> path, int currentGold = -1, int currentHp = -1, int maxHp = -1)
     {
-        if (path == null) return 0;
+        if (path == null) return 0.0;
 
-        int score = 0;
+        bool useDynamic = DynamicScoringEnabled && currentGold >= 0 && currentHp >= 0 && maxHp > 0;
+
+        if (!useDynamic)
+        {
+            double staticScore = 0.0;
+            foreach (var point in path)
+            {
+                if (ScoringWeights.TryGetValue(point.PointType, out int weight))
+                {
+                    staticScore += weight;
+                }
+            }
+            return staticScore;
+        }
+
+        double projectedGold = currentGold;
+        double projectedHealth = currentHp;
+        double score = 0.0;
+
         foreach (var point in path)
         {
-            if (ScoringWeights.TryGetValue(point.PointType, out int weight))
+            if (!ScoringWeights.TryGetValue(point.PointType, out int baseWeight))
             {
-                score += weight;
+                baseWeight = 0;
             }
+
+            double modifier = 1.0;
+
+            if (DynamicScoring.ScalingRules.TryGetValue(point.PointType, out var rule))
+            {
+                double healthPct = projectedHealth / maxHp;
+
+                switch (rule.Resource)
+                {
+                    case "Gold":
+                        if (rule.Baseline > 0)
+                            modifier = projectedGold / rule.Baseline;
+                        break;
+                    case "Health":
+                        if (rule.Baseline > 0)
+                            modifier = healthPct / rule.Baseline;
+                        break;
+                    case "InverseHealth":
+                        if (rule.Baseline < 1.0)
+                            modifier = (1.0 - healthPct) / (1.0 - rule.Baseline);
+                        break;
+                }
+
+                modifier = Math.Clamp(modifier, DynamicScoring.MinModifier, DynamicScoring.MaxModifier);
+            }
+
+            score += baseWeight * modifier;
+
+            // Project resources forward
+            if (DynamicScoring.GoldDeltas.TryGetValue(point.PointType, out int goldDelta))
+                projectedGold += goldDelta;
+            projectedGold = Math.Max(projectedGold, 0);
+
+            if (DynamicScoring.HealthDeltas.TryGetValue(point.PointType, out int healthDelta))
+                projectedHealth += healthDelta;
+            projectedHealth = Math.Clamp(projectedHealth, 1, maxHp);
         }
+
         return score;
     }
 }
@@ -103,6 +224,34 @@ public static class RouteSuggest
     /// <summary>
     /// Default path configurations used as fallback and for reset functionality.
     /// </summary>
+    private static readonly DynamicScoringConfig DefaultDynamicScoringConfig = new DynamicScoringConfig
+    {
+        GoldDeltas = new Dictionary<MapPointType, int>
+        {
+            { MapPointType.Monster, 25 },
+            { MapPointType.Elite, 40 },
+            { MapPointType.Shop, -80 },
+            { MapPointType.Treasure, 0 },
+            { MapPointType.Unknown, 10 }
+        },
+        HealthDeltas = new Dictionary<MapPointType, int>
+        {
+            { MapPointType.Monster, -15 },
+            { MapPointType.Elite, -30 },
+            { MapPointType.RestSite, 30 },
+            { MapPointType.Unknown, -5 }
+        },
+        ScalingRules = new Dictionary<MapPointType, ScalingRule>
+        {
+            { MapPointType.Shop, new ScalingRule { Resource = "Gold", Baseline = 100 } },
+            { MapPointType.Monster, new ScalingRule { Resource = "Health", Baseline = 0.7 } },
+            { MapPointType.Elite, new ScalingRule { Resource = "Health", Baseline = 0.7 } },
+            { MapPointType.RestSite, new ScalingRule { Resource = "InverseHealth", Baseline = 0.5 } }
+        },
+        MinModifier = 0.0,
+        MaxModifier = 2.0
+    };
+
     private static readonly List<PathConfig> DefaultPathConfigs = new List<PathConfig>
     {
         new PathConfig
@@ -118,7 +267,9 @@ public static class RouteSuggest
                 { MapPointType.Monster, -1 },
                 { MapPointType.Elite, -3 },
                 { MapPointType.Unknown, 0 }
-            }
+            },
+            DynamicScoringEnabled = false,
+            DynamicScoring = DefaultDynamicScoringConfig
         },
         new PathConfig
         {
@@ -133,7 +284,9 @@ public static class RouteSuggest
                 { MapPointType.Monster, 2 },
                 { MapPointType.Elite, 3 },
                 { MapPointType.Unknown, 2 }
-            }
+            },
+            DynamicScoringEnabled = false,
+            DynamicScoring = DefaultDynamicScoringConfig
         }
     };
 
@@ -148,9 +301,18 @@ public static class RouteSuggest
     private static FieldInfo _pathsField;
 
     /// <summary>
-    /// Whether reflection has been successfully initialized.
+    /// Whether map screen reflection has been successfully initialized.
     /// </summary>
     private static bool _reflectionInitialized = false;
+
+    /// <summary>
+    /// Cached property/field accessors for player gold, current HP, and max HP.
+    /// Discovered via reflection on RunState or related player objects.
+    /// </summary>
+    private static Func<RunState, int> _getGold;
+    private static Func<RunState, int> _getCurrentHp;
+    private static Func<RunState, int> _getMaxHp;
+    private static bool _runStateReflectionInitialized = false;
 
     /// <summary>
     /// Flag indicating if a highlight request is pending for when the map screen opens.
@@ -336,7 +498,16 @@ public static class RouteSuggest
                             Name = $"Path{PathConfigs.Count + 1}",
                             Color = new Color(1f, 1f, 1f, 1f),
                             Priority = 50,
-                            ScoringWeights = new Dictionary<MapPointType, int>()
+                            ScoringWeights = new Dictionary<MapPointType, int>(),
+                            DynamicScoringEnabled = false,
+                            DynamicScoring = new DynamicScoringConfig
+                            {
+                                GoldDeltas = new Dictionary<MapPointType, int>(DefaultDynamicScoringConfig.GoldDeltas),
+                                HealthDeltas = new Dictionary<MapPointType, int>(DefaultDynamicScoringConfig.HealthDeltas),
+                                ScalingRules = new Dictionary<MapPointType, ScalingRule>(DefaultDynamicScoringConfig.ScalingRules),
+                                MinModifier = DefaultDynamicScoringConfig.MinModifier,
+                                MaxModifier = DefaultDynamicScoringConfig.MaxModifier
+                            }
                         };
                         PathConfigs.Add(newConfig);
                         SaveAndUpdatePath();
@@ -412,6 +583,19 @@ public static class RouteSuggest
                     onChanged: (value) =>
                     {
                         config.Priority = (int)(float)value;
+                        SaveAndUpdatePath();
+                    }));
+
+                // Dynamic Scoring toggle
+                entries.Add(MakeEntry($"path_{i}_dynamic_scoring", "Dynamic Scoring (0=off, 1=on)",
+                    GetConfigType("Slider"),
+                    defaultValue: config.DynamicScoringEnabled ? 1f : 0f,
+                    min: 0, max: 1, step: 1, format: "F0",
+                    labels: new() { { "zhs", "动态评分 (0=关闭, 1=开启)" } },
+                    descriptions: new() { { "en", "Scale room weights based on projected gold and health. Configure details in RouteSuggestConfig.json." }, { "zhs", "根据预测的金币和生命值缩放房间权重。在 RouteSuggestConfig.json 中配置详情。" } },
+                    onChanged: (value) =>
+                    {
+                        config.DynamicScoringEnabled = (int)(float)value == 1;
                         SaveAndUpdatePath();
                     }));
 
@@ -586,7 +770,7 @@ public static class RouteSuggest
 
             var configData = new ConfigFile
             {
-                SchemaVersion = 2,
+                SchemaVersion = 3,
                 HighlightType = CurrentHighlightType.ToString(),
                 PathConfigs = new List<PathConfigEntry>()
             };
@@ -598,12 +782,41 @@ public static class RouteSuggest
                     Name = config.Name,
                     Color = $"#{config.Color.ToHtml(false)}",
                     Priority = config.Priority,
-                    ScoringWeights = new Dictionary<string, int>()
+                    ScoringWeights = new Dictionary<string, int>(),
+                    DynamicScoringEnabled = config.DynamicScoringEnabled
                 };
 
                 foreach (var weight in config.ScoringWeights)
                 {
                     entry.ScoringWeights[weight.Key.ToString()] = weight.Value;
+                }
+
+                // Serialize dynamic scoring config
+                if (config.DynamicScoring != null)
+                {
+                    var dsEntry = new DynamicScoringConfigEntry
+                    {
+                        GoldDeltas = new Dictionary<string, int>(),
+                        HealthDeltas = new Dictionary<string, int>(),
+                        ScalingRules = new Dictionary<string, ScalingRuleEntry>(),
+                        MinModifier = config.DynamicScoring.MinModifier,
+                        MaxModifier = config.DynamicScoring.MaxModifier
+                    };
+
+                    foreach (var kvp in config.DynamicScoring.GoldDeltas)
+                        dsEntry.GoldDeltas[kvp.Key.ToString()] = kvp.Value;
+                    foreach (var kvp in config.DynamicScoring.HealthDeltas)
+                        dsEntry.HealthDeltas[kvp.Key.ToString()] = kvp.Value;
+                    foreach (var kvp in config.DynamicScoring.ScalingRules)
+                    {
+                        dsEntry.ScalingRules[kvp.Key.ToString()] = new ScalingRuleEntry
+                        {
+                            Resource = kvp.Value.Resource,
+                            Baseline = kvp.Value.Baseline
+                        };
+                    }
+
+                    entry.DynamicScoring = dsEntry;
                 }
 
                 configData.PathConfigs.Add(entry);
@@ -642,7 +855,16 @@ public static class RouteSuggest
                 Name = defaultConfig.Name,
                 Color = defaultConfig.Color,
                 Priority = defaultConfig.Priority,
-                ScoringWeights = new Dictionary<MapPointType, int>(defaultConfig.ScoringWeights)
+                ScoringWeights = new Dictionary<MapPointType, int>(defaultConfig.ScoringWeights),
+                DynamicScoringEnabled = defaultConfig.DynamicScoringEnabled,
+                DynamicScoring = new DynamicScoringConfig
+                {
+                    GoldDeltas = new Dictionary<MapPointType, int>(defaultConfig.DynamicScoring.GoldDeltas),
+                    HealthDeltas = new Dictionary<MapPointType, int>(defaultConfig.DynamicScoring.HealthDeltas),
+                    ScalingRules = new Dictionary<MapPointType, ScalingRule>(defaultConfig.DynamicScoring.ScalingRules),
+                    MinModifier = defaultConfig.DynamicScoring.MinModifier,
+                    MaxModifier = defaultConfig.DynamicScoring.MaxModifier
+                }
             };
             PathConfigs.Add(config);
         }
@@ -677,7 +899,7 @@ public static class RouteSuggest
 
             var configData = JsonSerializer.Deserialize<ConfigFile>(json, options);
 
-            if (configData?.SchemaVersion != 1 && configData?.SchemaVersion != 2)
+            if (configData?.SchemaVersion < 1 || configData?.SchemaVersion > 3)
             {
                 LogWithTimestamp($"Unsupported schema version {configData?.SchemaVersion}, using defaults");
                 return;
@@ -708,8 +930,28 @@ public static class RouteSuggest
                     Name = configEntry.Name,
                     Priority = configEntry.Priority,
                     Color = ParseColor(configEntry.Color),
-                    ScoringWeights = ParseScoringWeights(configEntry.ScoringWeights)
+                    ScoringWeights = ParseScoringWeights(configEntry.ScoringWeights),
+                    DynamicScoringEnabled = configEntry.DynamicScoringEnabled ?? false
                 };
+
+                // Parse dynamic scoring config if present
+                if (configEntry.DynamicScoring != null)
+                {
+                    var ds = configEntry.DynamicScoring;
+                    config.DynamicScoring = new DynamicScoringConfig
+                    {
+                        GoldDeltas = ParseIntDeltas(ds.GoldDeltas),
+                        HealthDeltas = ParseIntDeltas(ds.HealthDeltas),
+                        ScalingRules = ParseScalingRules(ds.ScalingRules),
+                        MinModifier = ds.MinModifier ?? 0.0,
+                        MaxModifier = ds.MaxModifier ?? 2.0
+                    };
+                    LogWithTimestamp($"  Dynamic scoring: enabled={config.DynamicScoringEnabled}, " +
+                                   $"gold_deltas={config.DynamicScoring.GoldDeltas.Count}, " +
+                                   $"health_deltas={config.DynamicScoring.HealthDeltas.Count}, " +
+                                   $"scaling_rules={config.DynamicScoring.ScalingRules.Count}");
+                }
+
                 PathConfigs.Add(config);
                 LogWithTimestamp($"Loaded path config '{config.Name}' from file");
             }
@@ -811,6 +1053,45 @@ public static class RouteSuggest
     }
 
     /// <summary>
+    /// Parses a string-keyed int dictionary into a MapPointType-keyed int dictionary.
+    /// Used for gold_deltas and health_deltas in dynamic scoring config.
+    /// </summary>
+    static Dictionary<MapPointType, int> ParseIntDeltas(Dictionary<string, int> dict)
+    {
+        var result = new Dictionary<MapPointType, int>();
+        if (dict == null) return result;
+
+        foreach (var kvp in dict)
+        {
+            if (Enum.TryParse<MapPointType>(kvp.Key, out var pointType))
+                result[pointType] = kvp.Value;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Parses scaling rules from string-keyed DTO dictionary into MapPointType-keyed ScalingRule dictionary.
+    /// </summary>
+    static Dictionary<MapPointType, ScalingRule> ParseScalingRules(Dictionary<string, ScalingRuleEntry> dict)
+    {
+        var result = new Dictionary<MapPointType, ScalingRule>();
+        if (dict == null) return result;
+
+        foreach (var kvp in dict)
+        {
+            if (Enum.TryParse<MapPointType>(kvp.Key, out var pointType))
+            {
+                result[pointType] = new ScalingRule
+                {
+                    Resource = kvp.Value.Resource,
+                    Baseline = kvp.Value.Baseline
+                };
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Represents the root structure of the RouteSuggestConfig.json file.
     /// </summary>
     private class ConfigFile
@@ -840,29 +1121,50 @@ public static class RouteSuggest
     /// </summary>
     private class PathConfigEntry
     {
-        /// <summary>
-        /// Name identifier for the path.
-        /// </summary>
         [JsonPropertyName("name")]
         public string Name { get; set; }
 
-        /// <summary>
-        /// Hex color string (e.g., "#FFD700").
-        /// </summary>
         [JsonPropertyName("color")]
         public string Color { get; set; }
 
-        /// <summary>
-        /// Priority value - higher renders on top.
-        /// </summary>
         [JsonPropertyName("priority")]
         public int Priority { get; set; }
 
-        /// <summary>
-        /// Scoring weights as string-keyed dictionary (keys are MapPointType names).
-        /// </summary>
         [JsonPropertyName("scoring_weights")]
         public Dictionary<string, int> ScoringWeights { get; set; }
+
+        [JsonPropertyName("dynamic_scoring_enabled")]
+        public bool? DynamicScoringEnabled { get; set; }
+
+        [JsonPropertyName("dynamic_scoring")]
+        public DynamicScoringConfigEntry DynamicScoring { get; set; }
+    }
+
+    private class DynamicScoringConfigEntry
+    {
+        [JsonPropertyName("gold_deltas")]
+        public Dictionary<string, int> GoldDeltas { get; set; }
+
+        [JsonPropertyName("health_deltas")]
+        public Dictionary<string, int> HealthDeltas { get; set; }
+
+        [JsonPropertyName("scaling_rules")]
+        public Dictionary<string, ScalingRuleEntry> ScalingRules { get; set; }
+
+        [JsonPropertyName("min_modifier")]
+        public double? MinModifier { get; set; }
+
+        [JsonPropertyName("max_modifier")]
+        public double? MaxModifier { get; set; }
+    }
+
+    private class ScalingRuleEntry
+    {
+        [JsonPropertyName("resource")]
+        public string Resource { get; set; }
+
+        [JsonPropertyName("baseline")]
+        public double Baseline { get; set; }
     }
 
     /// <summary>
@@ -893,12 +1195,129 @@ public static class RouteSuggest
     }
 
     /// <summary>
+    /// Initializes reflection accessors for RunState properties: Gold, CurrentHp, MaxHp.
+    /// Tries direct properties on RunState first, then looks through Player/LocalPlayer objects.
+    /// Falls back gracefully if properties cannot be found.
+    /// </summary>
+    static void InitializeRunStateReflection(RunState runState)
+    {
+        if (_runStateReflectionInitialized) return;
+
+        try
+        {
+            var rsType = runState.GetType();
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+            // Log all properties for discovery
+            LogWithTimestamp("Discovering RunState properties:");
+            foreach (var prop in rsType.GetProperties(flags))
+            {
+                LogWithTimestamp($"  RunState.{prop.Name} : {prop.PropertyType.Name}");
+            }
+
+            // Try to find Gold directly on RunState
+            _getGold = BuildIntGetter(rsType, "Gold", flags)
+                    ?? BuildIntGetter(rsType, "CurrentGold", flags);
+
+            // Try to find HP directly on RunState
+            _getCurrentHp = BuildIntGetter(rsType, "CurrentHp", flags);
+            _getMaxHp = BuildIntGetter(rsType, "MaxHp", flags);
+
+            // If not found directly, try through Player or LocalPlayer property
+            if (_getGold == null || _getCurrentHp == null || _getMaxHp == null)
+            {
+                LogWithTimestamp("Some properties not found on RunState directly, searching via Player...");
+
+                var playerProp = rsType.GetProperty("Player", flags)
+                              ?? rsType.GetProperty("LocalPlayer", flags);
+
+                if (playerProp != null)
+                {
+                    var playerType = playerProp.PropertyType;
+                    LogWithTimestamp($"Found player property: {playerProp.Name} of type {playerType.Name}");
+
+                    foreach (var prop in playerType.GetProperties(flags))
+                    {
+                        LogWithTimestamp($"  {playerProp.Name}.{prop.Name} : {prop.PropertyType.Name}");
+                    }
+
+                    _getGold ??= BuildChainedIntGetter(rsType, playerProp, playerType, "Gold", flags)
+                              ?? BuildChainedIntGetter(rsType, playerProp, playerType, "CurrentGold", flags);
+                    _getCurrentHp ??= BuildChainedIntGetter(rsType, playerProp, playerType, "CurrentHp", flags)
+                                  ?? BuildChainedIntGetter(rsType, playerProp, playerType, "Hp", flags);
+                    _getMaxHp ??= BuildChainedIntGetter(rsType, playerProp, playerType, "MaxHp", flags);
+                }
+            }
+
+            LogWithTimestamp($"RunState reflection: Gold={(_getGold != null ? "found" : "MISSING")}, " +
+                           $"CurrentHp={(_getCurrentHp != null ? "found" : "MISSING")}, " +
+                           $"MaxHp={(_getMaxHp != null ? "found" : "MISSING")}");
+
+            _runStateReflectionInitialized = true;
+        }
+        catch (Exception ex)
+        {
+            LogWithTimestamp($"Error initializing RunState reflection: {ex.Message}");
+            _runStateReflectionInitialized = true; // Don't retry on failure
+        }
+    }
+
+    /// <summary>
+    /// Builds a Func that reads an int property from a RunState instance. Returns null if not found.
+    /// </summary>
+    static Func<RunState, int> BuildIntGetter(Type type, string propName, BindingFlags flags)
+    {
+        var prop = type.GetProperty(propName, flags);
+        if (prop != null && (prop.PropertyType == typeof(int) || prop.PropertyType == typeof(long)))
+        {
+            LogWithTimestamp($"Found {type.Name}.{propName}");
+            return rs => (int)prop.GetValue(rs);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Builds a Func that reads an int property through an intermediate object (e.g., RunState.Player.Gold).
+    /// </summary>
+    static Func<RunState, int> BuildChainedIntGetter(Type rsType, PropertyInfo intermediateProp, Type intermediateType, string propName, BindingFlags flags)
+    {
+        var prop = intermediateType.GetProperty(propName, flags);
+        if (prop != null && (prop.PropertyType == typeof(int) || prop.PropertyType == typeof(long)))
+        {
+            LogWithTimestamp($"Found {intermediateProp.Name}.{propName}");
+            return rs =>
+            {
+                var intermediate = intermediateProp.GetValue(rs);
+                if (intermediate == null) return -1;
+                return (int)prop.GetValue(intermediate);
+            };
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Gets the current gold from RunState via reflection. Returns -1 if unavailable.
+    /// </summary>
+    static int GetGold(RunState rs) => _getGold != null ? _getGold(rs) : -1;
+
+    /// <summary>
+    /// Gets the current HP from RunState via reflection. Returns -1 if unavailable.
+    /// </summary>
+    static int GetCurrentHp(RunState rs) => _getCurrentHp != null ? _getCurrentHp(rs) : -1;
+
+    /// <summary>
+    /// Gets the max HP from RunState via reflection. Returns -1 if unavailable.
+    /// </summary>
+    static int GetMaxHp(RunState rs) => _getMaxHp != null ? _getMaxHp(rs) : -1;
+
+    /// <summary>
     /// Called when a new run starts. Stores the run state and calculates initial paths.
     /// </summary>
     static void OnRunStarted(RunState runState)
     {
         LogWithTimestamp("Run started");
         RouteSuggest.RunState = runState;
+        InitializeRunStateReflection(runState);
         UpdateBestPath();
     }
 
@@ -1015,6 +1434,12 @@ public static class RouteSuggest
         LogWithTimestamp($"Current act index {runState.CurrentActIndex}");
         LogWithTimestamp($"Floor {runState.ActFloor}/{runState.TotalFloor}");
 
+        // Get current game state for dynamic scoring
+        int gold = GetGold(runState);
+        int currentHp = GetCurrentHp(runState);
+        int maxHp = GetMaxHp(runState);
+        LogWithTimestamp($"Player state: Gold={gold}, HP={currentHp}/{maxHp}");
+
         // Get current position, fallback to starting point if not set
         var startPoint = runState.CurrentMapPoint ?? runState.Map?.StartingMapPoint;
 
@@ -1026,11 +1451,11 @@ public static class RouteSuggest
             CalculatedPaths.Clear();
             foreach (var config in PathConfigs)
             {
-                var paths = FindOptimalPaths(startPoint, config);
+                var paths = FindOptimalPaths(startPoint, config, gold, currentHp, maxHp);
                 if (paths.Count > 0)
                 {
-                    int score = config.CalculateScore(paths[0]);
-                    LogWithTimestamp($"{config.Name}: {paths.Count} optimal path(s) found with score {score}");
+                    double score = config.CalculateScore(paths[0], gold, currentHp, maxHp);
+                    LogWithTimestamp($"{config.Name}: {paths.Count} optimal path(s) found with score {score:F2}");
                     CalculatedPaths[config.Name] = paths;
                 }
             }
@@ -1043,8 +1468,12 @@ public static class RouteSuggest
     /// </summary>
     /// <param name="startPoint">Starting map point.</param>
     /// <param name="config">Path configuration with scoring weights.</param>
+    /// <param name="gold">Current gold for dynamic scoring, or -1 if unavailable.</param>
+    /// <param name="currentHp">Current HP for dynamic scoring, or -1 if unavailable.</param>
+    /// <param name="maxHp">Max HP for dynamic scoring, or -1 if unavailable.</param>
     /// <returns>List of optimal paths. Empty list if no paths found.</returns>
-    static List<List<MapPoint>> FindOptimalPaths(MapPoint startPoint, PathConfig config)
+    static List<List<MapPoint>> FindOptimalPaths(MapPoint startPoint, PathConfig config,
+        int gold = -1, int currentHp = -1, int maxHp = -1)
     {
         if (startPoint == null) return new List<List<MapPoint>>();
 
@@ -1073,13 +1502,13 @@ public static class RouteSuggest
             return new List<List<MapPoint>>();
         }
 
-        int bestScore = int.MinValue;
+        double bestScore = double.MinValue;
         var optimalPaths = new List<List<MapPoint>>();
 
         for (int i = 0; i < allPaths.Count; i++)
         {
-            int score = config.CalculateScore(allPaths[i]);
-            LogWithTimestamp($"Path {i + 1} score: {score}");
+            double score = config.CalculateScore(allPaths[i], gold, currentHp, maxHp);
+            LogWithTimestamp($"Path {i + 1} score: {score:F2}");
 
             if (score > bestScore)
             {
@@ -1087,13 +1516,13 @@ public static class RouteSuggest
                 optimalPaths.Clear();
                 optimalPaths.Add(allPaths[i]);
             }
-            else if (score == bestScore)
+            else if (Math.Abs(score - bestScore) < 0.001)
             {
                 optimalPaths.Add(allPaths[i]);
             }
         }
 
-        LogWithTimestamp($"Found {optimalPaths.Count} optimal path(s) with score {bestScore}");
+        LogWithTimestamp($"Found {optimalPaths.Count} optimal path(s) with score {bestScore:F2}");
 
         // If HighlightType.One, return only one path (first for consistency)
         if (CurrentHighlightType == HighlightType.One && optimalPaths.Count > 1)

@@ -1,30 +1,43 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "highlight_type": "One",
   "path_configs": [
     {
-      "name": "Safe",
+      "name": "Optimal",
       "color": "#FFD700",
       "priority": 100,
       "scoring_weights": {
-        "RestSite": 1,
+        "RestSite": 4,
         "Treasure": 1,
-        "Shop": 1,
-        "Monster": -1,
-        "Elite": -2
-      }
-    },
-    {
-      "name": "Aggressive",
-      "color": "#FF0000",
-      "priority": 50,
-      "scoring_weights": {
-        "RestSite": 1,
-        "Treasure": 1,
-        "Shop": 1,
-        "Monster": 1,
-        "Elite": 2,
-        "Unknown": 1
+        "Shop": 2,
+        "Monster": 2,
+        "Elite": 4,
+        "Unknown": 2,
+        "Boss": 0
+      },
+      "dynamic_scoring_enabled": true,
+      "dynamic_scoring": {
+        "gold_deltas": {
+          "Monster": 15,
+          "Elite": 25,
+          "Shop": -300,
+          "Treasure": 0,
+          "Unknown": 10
+        },
+        "health_deltas": {
+          "Monster": -15,
+          "Elite": -30,
+          "RestSite": 30,
+          "Unknown": -5
+        },
+        "scaling_rules": {
+          "Shop": { "resource": "Gold", "baseline": 250 },
+          "Monster": { "resource": "Health", "baseline": 0.5 },
+          "Elite": { "resource": "Health", "baseline": 0.7 },
+          "RestSite": { "resource": "InverseHealth", "baseline": 0.5 }
+        },
+        "min_modifier": 0.0,
+        "max_modifier": 2.0
       }
     }
   ]
